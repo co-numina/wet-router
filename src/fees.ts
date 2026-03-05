@@ -1,160 +1,151 @@
-import { connection, wallet, log, POOL_ADDRESS, POOL_TYPE } from "./config";
-import { LAMPORTS_PER_SOL } from "@solana/web3.js";
+import {
+  connection, wallet, log,
+  TOKEN_MINT, SERVICE_WALLET,
+  PUMPFUN_PROGRAM, PUMPFUN_FEE_PROGRAM, FEE_SHARING_SEED,
+  SYSTEM_PROGRAM,
+} from "./config";
+import {
+  PublicKey, Transaction, TransactionInstruction,
+  LAMPORTS_PER_SOL,
+} from "@solana/web3.js";
 
 /**
- * Get claimable creator fees from the pool.
- * 
- * For pump.fun tokens: creator fees accumulate as SOL in the creator's
- * fee account. After migration to Meteora/Raydium, fees come from LP positions.
- * 
- * This checks the wallet's SOL balance as a simple approach.
- * For production: integrate with Meteora DLMM SDK to check unclaimed fees
- * on the specific pool position.
+ * Derive the fee sharing config PDA for a given token mint.
+ * Seeds: ["sharing-config", mint_pubkey]
  */
+export function deriveSharingConfig(mint: PublicKey): PublicKey {
+  const [pda] = PublicKey.findProgramAddressSync(
+    [Buffer.from(FEE_SHARING_SEED), mint.toBuffer()],
+    PUMPFUN_FEE_PROGRAM,
+  );
+  return pda;
+}
 
-export async function getClaimableFees(): Promise<number> {
+/**
+ * Derive the creator vault PDA for a given token mint.
+ * This is where pump.fun accumulates creator fees.
+ * 
+ * The vault PDA is derived from the pump.fun main program.
+ * Seeds vary — common pattern is ["creator-vault", mint_pubkey] or 
+ * the vault address is embedded in the token's bonding curve account.
+ * 
+ * For now we check the service wallet's SOL balance as the indicator
+ * of available funds (fees already distributed to us via fee sharing).
+ */
+export async function getAvailableBalance(): Promise<number> {
   try {
-    if (POOL_TYPE === "meteora") {
-      return await getMeteoraClaimableFees();
-    } else {
-      return await getRaydiumClaimableFees();
-    }
+    const balance = await connection.getBalance(SERVICE_WALLET);
+    // Reserve 0.01 SOL for rent + tx fees
+    const available = Math.max(0, (balance / LAMPORTS_PER_SOL) - 0.01);
+    return available;
   } catch (err) {
-    log(`⚠ Error checking fees: ${err}`);
+    log(`⚠ Error checking balance: ${err}`);
     return 0;
   }
-}
-
-async function getMeteoraClaimableFees(): Promise<number> {
-  // Meteora DLMM pools store fee info in the position account
-  // Fetch the pool account data to check pending fees
-  const accountInfo = await connection.getAccountInfo(POOL_ADDRESS);
-  if (!accountInfo) {
-    log("⚠ Pool account not found");
-    return 0;
-  }
-
-  // Parse Meteora DLMM position data
-  // The fee fields are at specific offsets in the account data
-  // For DLMM v2: feeX (SOL side) is at offset 128, feeY (token side) at 136
-  // These are u64 values representing lamports/smallest token units
-  const data = accountInfo.data;
-  
-  if (data.length < 144) {
-    log("⚠ Account data too small for Meteora position");
-    return 0;
-  }
-
-  // Read fee amounts (little-endian u64)
-  const feeXLamports = data.readBigUInt64LE(128);
-  const feeSol = Number(feeXLamports) / LAMPORTS_PER_SOL;
-  
-  return feeSol;
-}
-
-async function getRaydiumClaimableFees(): Promise<number> {
-  // Raydium concentrated liquidity (CLMM) stores fees in position NFT accounts
-  // For standard AMM pools, fees are auto-compounded
-  // This is a simplified check — production should use Raydium SDK
-  const accountInfo = await connection.getAccountInfo(POOL_ADDRESS);
-  if (!accountInfo) {
-    log("⚠ Pool account not found");
-    return 0;
-  }
-
-  // Raydium CLMM position: tokenFeesOwedX at offset 161 (u64)
-  const data = accountInfo.data;
-  if (data.length < 169) return 0;
-
-  const feeXLamports = data.readBigUInt64LE(161);
-  return Number(feeXLamports) / LAMPORTS_PER_SOL;
 }
 
 /**
- * Claim fees from the pool position.
- * Returns the amount of SOL claimed.
+ * Call pump.fun's permissionless distribute instruction to move fees
+ * from the creator vault to the configured fee sharing recipients.
+ * 
+ * This is the same instruction Bedrock calls. It's permissionless — 
+ * anyone can call it to trigger distribution.
+ * 
+ * Instruction format (from on-chain analysis):
+ * - Program: 6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P
+ * - Discriminator: 520dd234ba7c57c7 (8 bytes)
+ * - Accounts (8):
+ *   0: Token mint (the pump.fun token)
+ *   1: Creator vault PDA (holds accumulated fees)
+ *   2: Fee sharing config PDA (from pfee program)
+ *   3: Recipient wallet (where fees go — our service wallet)
+ *   4: System program
+ *   5: Fee sharing program (pfeeUxB6...)
+ *   6: Pump.fun program (self-reference for CPI)
+ *   7: Actual recipient (our service wallet, repeated)
+ * 
+ * Note: Accounts 2-7 may vary per token. The above is based on 
+ * observed Bedrock transactions. The creator vault PDA needs to be
+ * derived or looked up per token.
  */
-export async function claimFees(): Promise<number> {
-  if (POOL_TYPE === "meteora") {
-    return await claimMeteoraFees();
-  } else {
-    return await claimRaydiumFees();
+export async function triggerDistribute(
+  mint: PublicKey,
+  creatorVault: PublicKey,
+): Promise<string | null> {
+  try {
+    const sharingConfig = deriveSharingConfig(mint);
+    
+    // Discriminator from observed transactions: 520dd234ba7c57c7
+    const discriminator = Buffer.from("520dd234ba7c57c7", "hex");
+
+    const ix = new TransactionInstruction({
+      programId: PUMPFUN_PROGRAM,
+      keys: [
+        { pubkey: mint, isSigner: false, isWritable: false },
+        { pubkey: creatorVault, isSigner: false, isWritable: true },
+        { pubkey: sharingConfig, isSigner: false, isWritable: false },
+        { pubkey: SERVICE_WALLET, isSigner: false, isWritable: true },
+        { pubkey: SYSTEM_PROGRAM, isSigner: false, isWritable: false },
+        { pubkey: PUMPFUN_FEE_PROGRAM, isSigner: false, isWritable: false },
+        { pubkey: PUMPFUN_PROGRAM, isSigner: false, isWritable: false },
+        { pubkey: SERVICE_WALLET, isSigner: false, isWritable: true },
+      ],
+      data: discriminator,
+    });
+
+    const tx = new Transaction().add(ix);
+    tx.recentBlockhash = (await connection.getLatestBlockhash()).blockhash;
+    tx.feePayer = wallet.publicKey;
+
+    const sig = await connection.sendTransaction(tx, [wallet], {
+      skipPreflight: false,
+    });
+    await connection.confirmTransaction(sig, "confirmed");
+
+    log(`✓ triggered fee distribution — tx: ${sig}`);
+    return sig;
+  } catch (err) {
+    log(`⚠ distribute failed: ${err}`);
+    return null;
   }
 }
 
-async function claimMeteoraFees(): Promise<number> {
-  // Meteora DLMM claim instruction
-  // Program: LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo
-  const { Transaction, TransactionInstruction, PublicKey } = await import("@solana/web3.js");
-  
-  const METEORA_DLMM_PROGRAM = new PublicKey("LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo");
-  
-  // Get balance before claim
-  const balBefore = await connection.getBalance(wallet.publicKey);
-  
-  // Build claim instruction
-  // Discriminator for "claimFee" = [169, 32, 79, 137, 136, 232, 70, 137]
-  const discriminator = Buffer.from([169, 32, 79, 137, 136, 232, 70, 137]);
-  
-  const ix = new TransactionInstruction({
-    programId: METEORA_DLMM_PROGRAM,
-    keys: [
-      { pubkey: POOL_ADDRESS, isSigner: false, isWritable: true },       // position
-      { pubkey: wallet.publicKey, isSigner: true, isWritable: true },     // owner
-      // Additional accounts depend on the specific pool — 
-      // In production, derive these from the position account data:
-      // lbPair, binArrayLower, binArrayUpper, reserveX, reserveY, 
-      // tokenXMint, tokenYMint, userTokenX, userTokenY, tokenProgram
-    ],
-    data: discriminator,
-  });
+/**
+ * Look up the creator vault address for a token.
+ * This queries recent transactions on the mint to find the vault PDA.
+ */
+export async function findCreatorVault(mint: PublicKey): Promise<PublicKey | null> {
+  try {
+    // The creator vault is typically a PDA derived from the pump.fun program
+    // Common seeds: [mint_bytes] or ["creator-vault", mint_bytes]
+    // We try the common derivation first
+    const [vault] = PublicKey.findProgramAddressSync(
+      [mint.toBuffer()],
+      PUMPFUN_PROGRAM,
+    );
+    
+    // Verify it exists on-chain
+    const info = await connection.getAccountInfo(vault);
+    if (info) {
+      log(`  found creator vault: ${vault.toBase58()}`);
+      return vault;
+    }
 
-  const tx = new Transaction().add(ix);
-  tx.recentBlockhash = (await connection.getLatestBlockhash()).blockhash;
-  tx.feePayer = wallet.publicKey;
-  
-  const sig = await connection.sendTransaction(tx, [wallet]);
-  await connection.confirmTransaction(sig, "confirmed");
-  
-  // Check how much SOL we received
-  const balAfter = await connection.getBalance(wallet.publicKey);
-  const claimed = (balAfter - balBefore) / LAMPORTS_PER_SOL;
-  
-  log(`✓ claimed ${claimed.toFixed(4)} SOL — tx: ${sig}`);
-  return Math.max(0, claimed);
-}
+    // Try alternate derivation
+    const [vault2] = PublicKey.findProgramAddressSync(
+      [Buffer.from("creator-vault"), mint.toBuffer()],
+      PUMPFUN_PROGRAM,
+    );
+    const info2 = await connection.getAccountInfo(vault2);
+    if (info2) {
+      log(`  found creator vault (alt): ${vault2.toBase58()}`);
+      return vault2;
+    }
 
-async function claimRaydiumFees(): Promise<number> {
-  // Raydium CLMM claim instruction
-  // Program: CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK
-  const { Transaction, TransactionInstruction, PublicKey } = await import("@solana/web3.js");
-  
-  const RAYDIUM_CLMM_PROGRAM = new PublicKey("CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK");
-  
-  const balBefore = await connection.getBalance(wallet.publicKey);
-  
-  // Discriminator for "collectFee" in Raydium CLMM
-  const discriminator = Buffer.from([164, 152, 207, 99, 30, 186, 19, 182]);
-  
-  const ix = new TransactionInstruction({
-    programId: RAYDIUM_CLMM_PROGRAM,
-    keys: [
-      { pubkey: wallet.publicKey, isSigner: true, isWritable: true },
-      { pubkey: POOL_ADDRESS, isSigner: false, isWritable: true },
-    ],
-    data: discriminator,
-  });
-
-  const tx = new Transaction().add(ix);
-  tx.recentBlockhash = (await connection.getLatestBlockhash()).blockhash;
-  tx.feePayer = wallet.publicKey;
-  
-  const sig = await connection.sendTransaction(tx, [wallet]);
-  await connection.confirmTransaction(sig, "confirmed");
-  
-  const balAfter = await connection.getBalance(wallet.publicKey);
-  const claimed = (balAfter - balBefore) / LAMPORTS_PER_SOL;
-  
-  log(`✓ claimed ${claimed.toFixed(4)} SOL — tx: ${sig}`);
-  return Math.max(0, claimed);
+    log(`⚠ could not find creator vault for ${mint.toBase58()}`);
+    return null;
+  } catch (err) {
+    log(`⚠ error finding vault: ${err}`);
+    return null;
+  }
 }

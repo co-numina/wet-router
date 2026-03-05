@@ -1,46 +1,63 @@
 import {
   connection, wallet, log,
-  TOKEN_MINT, WSOL_MINT, JUPITER_API, SLIPPAGE_BPS,
+  TOKEN_MINT, WSOL_MINT, JUPITER_BASE, JUPITER_API_KEY, SLIPPAGE_BPS,
 } from "./config";
 import { LAMPORTS_PER_SOL, VersionedTransaction } from "@solana/web3.js";
 
+const headers: Record<string, string> = {
+  "Content-Type": "application/json",
+};
+if (JUPITER_API_KEY) {
+  headers["x-api-key"] = JUPITER_API_KEY;
+}
+
 /**
- * Swap SOL for token using Jupiter v6 API.
- * Returns the amount of tokens received.
+ * Swap SOL for token using Jupiter Swap API v1.
+ * Requires API key from portal.jup.ag (free tier available).
  */
 export async function swapSolForToken(solAmount: number): Promise<{ tokensReceived: bigint; txSig: string }> {
   const lamports = Math.floor(solAmount * LAMPORTS_PER_SOL);
-
-  log(`→ swapping ${solAmount.toFixed(4)} SOL for ${TOKEN_MINT.toBase58().slice(0, 8)}...`);
+  log(`→ swapping ${solAmount.toFixed(4)} SOL for token...`);
 
   // 1. Get quote
-  const quoteUrl = new URL(`${JUPITER_API}/quote`);
+  const quoteUrl = new URL(`${JUPITER_BASE}/quote`);
   quoteUrl.searchParams.set("inputMint", WSOL_MINT.toBase58());
   quoteUrl.searchParams.set("outputMint", TOKEN_MINT.toBase58());
   quoteUrl.searchParams.set("amount", lamports.toString());
   quoteUrl.searchParams.set("slippageBps", SLIPPAGE_BPS.toString());
 
-  const quoteRes = await fetch(quoteUrl.toString());
-  if (!quoteRes.ok) throw new Error(`Jupiter quote failed: ${quoteRes.status}`);
+  const quoteRes = await fetch(quoteUrl.toString(), { headers });
+  if (!quoteRes.ok) {
+    const body = await quoteRes.text();
+    throw new Error(`Jupiter quote failed (${quoteRes.status}): ${body}`);
+  }
   const quote = await quoteRes.json() as { outAmount: string };
-
   const outAmount = BigInt(quote.outAmount);
-  log(`  quote: ${outAmount.toString()} tokens (slippage: ${SLIPPAGE_BPS}bps)`);
+  log(`  quote: ${outAmount.toString()} tokens`);
 
   // 2. Get swap transaction
-  const swapRes = await fetch(`${JUPITER_API}/swap`, {
+  const swapRes = await fetch(`${JUPITER_BASE}/swap`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers,
     body: JSON.stringify({
       quoteResponse: quote,
       userPublicKey: wallet.publicKey.toBase58(),
       wrapAndUnwrapSol: true,
       dynamicComputeUnitLimit: true,
-      prioritizationFeeLamports: 50000,
+      dynamicSlippage: true,
+      prioritizationFeeLamports: {
+        priorityLevelWithMaxLamports: {
+          priorityLevel: "high",
+          maxLamports: 200000,
+        },
+      },
     }),
   });
 
-  if (!swapRes.ok) throw new Error(`Jupiter swap failed: ${swapRes.status}`);
+  if (!swapRes.ok) {
+    const body = await swapRes.text();
+    throw new Error(`Jupiter swap failed (${swapRes.status}): ${body}`);
+  }
   const swapData = await swapRes.json() as { swapTransaction: string };
 
   // 3. Deserialize, sign, send
@@ -52,9 +69,60 @@ export async function swapSolForToken(solAmount: number): Promise<{ tokensReceiv
     skipPreflight: true,
     maxRetries: 3,
   });
-
   await connection.confirmTransaction(sig, "confirmed");
   log(`✓ swap complete — tx: ${sig}`);
 
   return { tokensReceived: outAmount, txSig: sig };
+}
+
+/**
+ * Swap token for SOL (for selling token side of LP management).
+ */
+export async function swapTokenForSol(tokenAmount: bigint): Promise<{ solReceived: number; txSig: string }> {
+  log(`→ swapping ${tokenAmount.toString()} tokens for SOL...`);
+
+  const quoteUrl = new URL(`${JUPITER_BASE}/quote`);
+  quoteUrl.searchParams.set("inputMint", TOKEN_MINT.toBase58());
+  quoteUrl.searchParams.set("outputMint", WSOL_MINT.toBase58());
+  quoteUrl.searchParams.set("amount", tokenAmount.toString());
+  quoteUrl.searchParams.set("slippageBps", SLIPPAGE_BPS.toString());
+
+  const quoteRes = await fetch(quoteUrl.toString(), { headers });
+  if (!quoteRes.ok) throw new Error(`Jupiter quote failed: ${quoteRes.status}`);
+  const quote = await quoteRes.json() as { outAmount: string };
+  const solOut = Number(BigInt(quote.outAmount)) / LAMPORTS_PER_SOL;
+
+  const swapRes = await fetch(`${JUPITER_BASE}/swap`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({
+      quoteResponse: quote,
+      userPublicKey: wallet.publicKey.toBase58(),
+      wrapAndUnwrapSol: true,
+      dynamicComputeUnitLimit: true,
+      dynamicSlippage: true,
+      prioritizationFeeLamports: {
+        priorityLevelWithMaxLamports: {
+          priorityLevel: "high",
+          maxLamports: 200000,
+        },
+      },
+    }),
+  });
+
+  if (!swapRes.ok) throw new Error(`Jupiter swap failed: ${swapRes.status}`);
+  const swapData = await swapRes.json() as { swapTransaction: string };
+
+  const txBuf = Buffer.from(swapData.swapTransaction, "base64");
+  const tx = VersionedTransaction.deserialize(txBuf);
+  tx.sign([wallet]);
+
+  const sig = await connection.sendRawTransaction(tx.serialize(), {
+    skipPreflight: true,
+    maxRetries: 3,
+  });
+  await connection.confirmTransaction(sig, "confirmed");
+  log(`✓ swap complete — ${solOut.toFixed(4)} SOL received — tx: ${sig}`);
+
+  return { solReceived: solOut, txSig: sig };
 }
