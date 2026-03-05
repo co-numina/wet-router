@@ -1,62 +1,73 @@
 import {
   connection, wallet, log,
-  CLAIM_THRESHOLD, POLL_INTERVAL, LP_PERCENTAGE,
-  TOKEN_MINT, SERVICE_WALLET, POOL_ADDRESS,
+  CLAIM_THRESHOLD, POLL_INTERVAL,
+  TOKEN_MINT,
+  parseLpTargets, LpTarget,
 } from "./config";
-import { getAvailableBalance, triggerDistribute, findCreatorVault } from "./fees";
+import { getCreatorVaultBalance, claimCreatorFees } from "./fees";
 import { swapSolForToken } from "./swap";
-import { addLiquidity } from "./liquidity";
-import { LAMPORTS_PER_SOL, PublicKey } from "@solana/web3.js";
+import { routeLiquidity, derivePumpPool } from "./liquidity";
+import { LAMPORTS_PER_SOL } from "@solana/web3.js";
 
-// ════════════════════════════════════════════
-// wet-router v2 — real fee-to-LP automation
-// uses pump.fun fee sharing (permissionless)
+// ════════════════════════════════════════════════════
+// wet-router v3 — multi-target fee-to-LP automation
+// pumpswap · meteora · raydium · orca
 // no protocol. no fee. no middleman.
-// ════════════════════════════════════════════
+// ════════════════════════════════════════════════════
 
-let creatorVault: PublicKey | null = null;
+let targets: LpTarget[];
 
 async function printConfig() {
   const bal = await connection.getBalance(wallet.publicKey);
-  const serviceBal = await connection.getBalance(SERVICE_WALLET);
-  console.log(`
-╔══════════════════════════════════════════════╗
-║          wet-router v2.0.0                    ║
-║   pump.fun fee sharing → LP automation        ║
-║   no protocol. no fee. no middleman.          ║
-╚══════════════════════════════════════════════╝
+  const vaultBal = await getCreatorVaultBalance();
+  const poolAddr = derivePumpPool();
 
-  operator wallet:  ${wallet.publicKey.toBase58()}
-  operator balance: ${(bal / LAMPORTS_PER_SOL).toFixed(4)} SOL
-  service wallet:   ${SERVICE_WALLET.toBase58()}
-  service balance:  ${(serviceBal / LAMPORTS_PER_SOL).toFixed(4)} SOL
-  token mint:       ${TOKEN_MINT.toBase58()}
-  pool:             ${POOL_ADDRESS?.toBase58() || "not set (buy-only mode)"}
-  threshold:        ${CLAIM_THRESHOLD} SOL
-  LP allocation:    ${LP_PERCENTAGE}%
-  poll interval:    ${POLL_INTERVAL}s
+  const targetStr = targets
+    .map(t => `${t.type} ${t.percent}%${t.pool ? ` → ${t.pool.toBase58().slice(0, 12)}...` : " (auto)"}`)
+    .join("\n                    ");
+
+  console.log(`
+╔══════════════════════════════════════════════════╗
+║          wet-router v3.0.0                        ║
+║   multi-target fee-to-LP automation               ║
+║   pumpswap · meteora · raydium · orca             ║
+║   no protocol. no fee. no middleman.              ║
+╚══════════════════════════════════════════════════╝
+
+  wallet:          ${wallet.publicKey.toBase58()}
+  wallet balance:  ${(bal / LAMPORTS_PER_SOL).toFixed(4)} SOL
+  token mint:      ${TOKEN_MINT.toBase58()}
+  pump pool:       ${poolAddr.toBase58()}
+  vault balance:   ${vaultBal.toFixed(4)} SOL (unclaimed fees)
+  threshold:       ${CLAIM_THRESHOLD} SOL
+  poll interval:   ${POLL_INTERVAL}s
+
+  LP targets:      ${targetStr}
 `);
 }
 
 /**
  * Main cycle:
- * 1. Call pump.fun's permissionless distribute to move fees to service wallet
- * 2. Check service wallet balance
- * 3. If above threshold: swap half to tokens, add to LP (or hold)
+ * 1. Claim creator fees from pump AMM vault → wallet
+ * 2. Check wallet balance
+ * 3. Swap half to tokens via Jupiter
+ * 4. Route SOL + tokens across configured LP targets
  */
 async function cycle() {
   try {
-    // Step 1: Try to trigger fee distribution from creator vault
-    if (creatorVault) {
-      log("→ triggering fee distribution from creator vault...");
-      await triggerDistribute(TOKEN_MINT, creatorVault);
-      // Wait a moment for the tx to settle
+    // Step 1: Check vault and claim if there are fees
+    const vaultBalance = await getCreatorVaultBalance();
+
+    if (vaultBalance > 0.001) {
+      log(`→ creator vault has ${vaultBalance.toFixed(4)} SOL — claiming...`);
+      await claimCreatorFees();
       await new Promise(r => setTimeout(r, 3000));
     }
 
-    // Step 2: Check available balance in service wallet
-    const available = await getAvailableBalance();
-    
+    // Step 2: Check wallet balance (minus rent reserve)
+    const walletBalance = await connection.getBalance(wallet.publicKey);
+    const available = Math.max(0, (walletBalance / LAMPORTS_PER_SOL) - 0.01);
+
     if (available < CLAIM_THRESHOLD) {
       log(`… ${available.toFixed(4)} SOL available (threshold: ${CLAIM_THRESHOLD}) — waiting`);
       return;
@@ -64,48 +75,53 @@ async function cycle() {
 
     log(`✓ ${available.toFixed(4)} SOL available — routing to LP...`);
 
-    // Step 3: Calculate allocation
-    const toLp = available * (LP_PERCENTAGE / 100);
-    const toKeep = available - toLp;
+    // Step 3: Check if any targets need tokens (non-pumpswap targets)
+    const needsTokens = targets.some(t => t.type !== "pumpswap");
+    let tokensAvailable = BigInt(0);
 
-    if (toKeep > 0) {
-      log(`  reserving ${toKeep.toFixed(4)} SOL for operating costs`);
-    }
+    if (needsTokens) {
+      // Swap half of available SOL for tokens
+      const solForSwap = available / 2;
+      const { tokensReceived } = await swapSolForToken(solForSwap);
+      tokensAvailable = tokensReceived;
+      log(`  swapped ${solForSwap.toFixed(4)} SOL → ${tokensReceived.toString()} tokens`);
 
-    if (toLp < 0.005) {
-      log(`  LP amount too small (${toLp.toFixed(4)} SOL) — skipping`);
-      return;
-    }
+      // Route remaining SOL + tokens to targets
+      const solForLp = available - solForSwap;
+      const results = await routeLiquidity(targets, solForLp, tokensAvailable);
 
-    // Step 4: Swap half to tokens via Jupiter
-    const solForSwap = toLp / 2;
-    const solForLp = toLp - solForSwap;
-
-    const { tokensReceived } = await swapSolForToken(solForSwap);
-
-    // Step 5: Add to LP (or hold if no pool set)
-    if (POOL_ADDRESS) {
-      await addLiquidity(solForLp, tokensReceived);
+      for (const r of results) {
+        if (r.sig) log(`  ✓ ${r.target}: ${r.sig}`);
+      }
     } else {
-      log(`  no pool configured — holding ${tokensReceived.toString()} tokens + ${solForLp.toFixed(4)} SOL`);
-      log(`  these can be manually added to LP at any time`);
+      // All targets are PumpSwap — SDK handles token swap internally via deposit
+      const results = await routeLiquidity(targets, available, BigInt(0));
+
+      for (const r of results) {
+        if (r.sig) log(`  ✓ ${r.target}: ${r.sig}`);
+      }
     }
 
-    log(`═══ cycle complete: ${available.toFixed(4)} SOL → ${toLp.toFixed(4)} SOL routed ═══`);
+    log(`═══ cycle complete: ${available.toFixed(4)} SOL routed ═══\n`);
   } catch (err) {
-    log(`⚠ cycle error: ${err}`);
+    log(`⚠ cycle error: ${err instanceof Error ? err.message : err}`);
   }
 }
 
 async function main() {
+  // Parse LP targets from config
+  targets = parseLpTargets();
+
   await printConfig();
 
-  // Find creator vault for the token
-  log("looking up creator vault...");
-  creatorVault = await findCreatorVault(TOKEN_MINT);
-  if (!creatorVault) {
-    log("⚠ could not find creator vault — will skip distribute calls");
-    log("  (fees must be manually distributed or arrive via fee sharing)");
+  // Verify PumpSwap pool exists (always derived for reference)
+  const poolAddr = derivePumpPool();
+  const poolInfo = await connection.getAccountInfo(poolAddr);
+  if (!poolInfo) {
+    log("⚠ canonical PumpSwap pool not found — token may not have graduated yet");
+    log("  wet-router will keep checking until the pool exists\n");
+  } else {
+    log(`✓ PumpSwap pool verified on-chain (${poolInfo.data.length} bytes)\n`);
   }
 
   log("starting fee monitor...\n");

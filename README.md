@@ -1,85 +1,145 @@
-# wet-router 💧
+# wet-router
 
-**Free fee-to-LP automation. No protocol. No fee. No middleman.**
+open-source fee-to-LP automation for pump.fun tokens.
 
-Protocols charge 10% to claim your creator fees and add them to LP. That's three clicks on Raydium. wet-router does it for free — open source, runs on your machine, you control everything.
+claims creator fees → swaps → routes liquidity across multiple DEXes. no protocol tax. no middleman. no fee.
 
-## What it does
+## supported targets
 
-1. **Monitors** your creator fee balance on Meteora/Raydium
-2. **Claims** fees when they exceed your threshold
-3. **Swaps** half to tokens via Jupiter (best route)
-4. **Adds** both sides to your LP position
-5. **Repeats** — every cycle, your pool gets deeper
+| target | pool type | SDK |
+|--------|-----------|-----|
+| **pumpswap** | constant-product AMM (canonical pool) | `@pump-fun/pump-swap-sdk` |
+| **meteora** | DLMM (concentrated liquidity) | `@meteora-ag/dlmm` |
+| **raydium** | CLMM (concentrated liquidity) | `@raydium-io/raydium-sdk-v2` |
+| **orca** | Whirlpool (concentrated liquidity) | `@orca-so/whirlpools-sdk` |
 
-## Quick Start
+you can route to a single target, split across multiple, or route to all.
+
+## how it works
+
+```
+bonding curve phase (pre-graduation):
+  → fees accumulate in creator vault
+  → no LP pool exists yet — wet-router waits
+
+after graduation (~$30-35K mcap):
+  → pump.fun creates PumpSwap AMM pool
+  → wet-router activates:
+
+  poll loop (every POLL_INTERVAL seconds)
+    │
+    ├─ check creator vault balance
+    │   └─ uses @pump-fun/pump-swap-sdk to read vault PDA
+    │
+    ├─ if balance >= CLAIM_THRESHOLD
+    │   └─ claim creator fees → SOL lands in wallet
+    │
+    ├─ swap half to tokens via Jupiter
+    │
+    └─ route SOL + tokens to configured LP targets
+        ├─ pumpswap: deposit to canonical pool (SDK handles both sides)
+        ├─ meteora: open DLMM position ±15 bins around active price
+        ├─ raydium: open CLMM position ±20 ticks around current price
+        └─ orca: open Whirlpool position ±20 ticks around current price
+```
+
+## quick start
 
 ```bash
-# Clone
 git clone https://github.com/co-numina/wet-router
 cd wet-router
-
-# Configure
 cp .env.example .env
-nano .env  # add your wallet key + pool address
-
-# Run
+# edit .env with your config
 npm install
 npm start
 ```
 
-## Configuration
+## configuration
 
-| Variable | Description | Default |
-|----------|-------------|---------|
-| `PRIVATE_KEY` | Your wallet private key (base58) | required |
-| `RPC_URL` | Helius or other Solana RPC | required |
-| `TOKEN_MINT` | Your token's mint address | required |
-| `POOL_ADDRESS` | Meteora/Raydium pool address | required |
-| `POOL_TYPE` | `meteora` or `raydium` | `meteora` |
-| `CLAIM_THRESHOLD` | Min SOL to trigger claim | `0.1` |
-| `POLL_INTERVAL` | Seconds between checks | `60` |
-| `LP_PERCENTAGE` | % of fees routed to LP | `100` |
-| `SLIPPAGE_BPS` | Jupiter swap slippage (bps) | `100` |
+```bash
+# required
+PRIVATE_KEY=           # wallet private key (base58)
+RPC_URL=               # helius or other solana RPC
+TOKEN_MINT=            # your token's mint address
 
-## How it works
+# LP routing (default: pumpswap only)
+LP_TARGETS=pumpswap                          # single target
+LP_TARGETS=pumpswap:60,meteora:40            # split
+LP_TARGETS=pumpswap:40,meteora:30,raydium:20,orca:10  # multi
+LP_TARGETS=all                               # equal split across configured pools
+
+# pool addresses (required for each non-pumpswap target)
+METEORA_POOL=          # meteora DLMM pool address
+RAYDIUM_POOL=          # raydium CLMM pool address
+ORCA_POOL=             # orca whirlpool address
+PUMPSWAP_POOL=         # optional — auto-derived from TOKEN_MINT
+
+# tuning
+CLAIM_THRESHOLD=0.05   # min SOL to trigger claim
+POLL_INTERVAL=120      # seconds between checks
+SLIPPAGE_BPS=200       # jupiter swap slippage (basis points)
+SLIPPAGE_PCT=2         # LP deposit slippage (percent)
+
+# optional
+JUPITER_API_KEY=       # from portal.jup.ag (free tier works)
+```
+
+## examples
+
+### basic: all fees → PumpSwap canonical pool
+```bash
+LP_TARGETS=pumpswap
+# that's it. pool address auto-derived from TOKEN_MINT.
+```
+
+### split: 60% PumpSwap, 40% Meteora
+```bash
+LP_TARGETS=pumpswap:60,meteora:40
+METEORA_POOL=ARwi1S4DaiTG5DX7S4M4ZsrXqpMD1MrTmbu9ue2tpmEq
+```
+
+### four-way split
+```bash
+LP_TARGETS=pumpswap:40,meteora:30,raydium:20,orca:10
+METEORA_POOL=...
+RAYDIUM_POOL=...
+ORCA_POOL=...
+```
+
+## vs competitors
+
+| | wet-router | bedrock | other protocols |
+|---|---|---|---|
+| fee | **0%** | 20% (10% rev + 10% eco) | 5-20% |
+| code | open source | closed | varies |
+| targets | pumpswap, meteora, raydium, orca | their own pools | single |
+| self-host | yes | no | no |
+| trust model | trustless (revoke admin) | trust bedrock | trust protocol |
+
+## architecture
 
 ```
-Trade Volume → Creator Fees accumulate
-                    ↓
-         wet-router monitors balance
-                    ↓
-         Threshold hit → auto-claim
-                    ↓
-         Split: 50% SOL / 50% → Jupiter swap to token
-                    ↓
-         Both sides → add to LP position
-                    ↓
-         Pool deeper. Slippage lower. Floor stronger.
+src/
+├── config.ts          # env loading, LP target parsing
+├── fees.ts            # creator vault balance + claim via pump SDK
+├── swap.ts            # SOL → token via Jupiter v1
+├── liquidity.ts       # multi-target router
+├── targets/
+│   ├── pumpswap.ts    # PumpSwap AMM deposit (official SDK)
+│   ├── meteora.ts     # Meteora DLMM position (official SDK)
+│   ├── raydium.ts     # Raydium CLMM position (official SDK)
+│   └── orca.ts        # Orca Whirlpool position (official SDK)
+└── index.ts           # main loop + orchestration
 ```
 
-## vs "Utility Protocols"
+## security
 
-| | Them | wet-router |
-|---|---|---|
-| Source | Closed | Open — read every line |
-| Fee | 10% of your fees | 0% forever |
-| Control | They hold your keys | Runs on your machine |
-| Trust | Trust their contract | Trust yourself |
+- use a dedicated wallet — don't use your main
+- `.env` is in `.gitignore` by default
+- test with tiny amounts first (`CLAIM_THRESHOLD=0.01`)
+- the bot only signs claim + swap + LP transactions
+- all code is open — read it before running
 
-## Important Notes
+## license
 
-- **This sends real transactions.** Test with small amounts first.
-- **Keep your private key safe.** Never share your `.env` file.
-- **RPC matters.** Use Helius or Triton for reliability. Free RPCs will rate-limit.
-- The discriminators and account layouts are based on current Meteora DLMM / Raydium CLMM versions. If programs update, offsets may change.
-
-## $WET
-
-$WET is the first token running wet-router live. Every fee claimed, every LP injection — tracked and verifiable on-chain at [wet-coin.vercel.app](https://wet-coin.vercel.app).
-
-$WET isn't a product. It's proof that you don't need to pay rent on your own liquidity.
-
-## License
-
-MIT — do whatever you want with it.
+MIT. do whatever you want with it.
