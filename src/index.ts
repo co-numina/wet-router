@@ -4,6 +4,7 @@ import {
   TOKEN_MINT,
   parseLpTargets, LpTarget,
 } from "./config";
+import { loadHistory } from "./history";
 import { getCreatorVaultBalance, claimCreatorFees } from "./fees";
 import { swapSolForToken } from "./swap";
 import { routeLiquidity, derivePumpPool } from "./liquidity";
@@ -102,7 +103,10 @@ async function cycle() {
       }
     }
 
-    log(`═══ cycle complete: ${available.toFixed(4)} SOL routed ═══\n`);
+    // Print running totals
+    const h = loadHistory();
+    log(`═══ cycle complete: ${available.toFixed(4)} SOL routed ═══`);
+    log(`    lifetime: ${h.totals.txCount} txs | claimed ${h.totals.claimed.toFixed(4)} | deposited ${h.totals.deposited.toFixed(4)} SOL\n`);
   } catch (err) {
     log(`⚠ cycle error: ${err instanceof Error ? err.message : err}`);
   }

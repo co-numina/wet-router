@@ -1,4 +1,5 @@
 import { connection, wallet, log, TOKEN_MINT, SLIPPAGE_PCT } from "../config";
+import { recordTx } from "../history";
 import DLMM from "@meteora-ag/dlmm";
 import { Keypair, PublicKey, Transaction, LAMPORTS_PER_SOL, sendAndConfirmTransaction } from "@solana/web3.js";
 import BN from "bn.js";
@@ -62,6 +63,17 @@ export async function addMeteoraLiquidity(
       addLiquidityTx,
       [wallet, positionKeypair],
     );
+
+    recordTx({
+      ts: new Date().toISOString(),
+      type: "lp-deposit",
+      sig,
+      sol: solAmount,
+      tokens: tokenAmount.toString(),
+      pool: poolAddress.toBase58(),
+      poolType: "meteora",
+      note: `position: ${positionKeypair.publicKey.toBase58()}, bins: ${minBinId}..${maxBinId}`,
+    });
 
     log(`  ✓ [meteora] added ${solAmount.toFixed(4)} SOL + tokens — position: ${positionKeypair.publicKey.toBase58()} — tx: ${sig}`);
     return sig;

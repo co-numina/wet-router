@@ -1,4 +1,5 @@
 import { connection, wallet, log, TOKEN_MINT, SLIPPAGE_PCT } from "../config";
+import { recordTx } from "../history";
 import {
   OnlinePumpAmmSdk,
   PUMP_AMM_SDK,
@@ -53,6 +54,16 @@ export async function addPumpswapLiquidity(
       skipPreflight: false,
     });
     await connection.confirmTransaction(sig, "confirmed");
+
+    recordTx({
+      ts: new Date().toISOString(),
+      type: "lp-deposit",
+      sig,
+      sol: solAmount,
+      pool: poolKey.toBase58(),
+      poolType: "pumpswap",
+      note: `deposit to PumpSwap canonical pool`,
+    });
 
     log(`  ✓ [pumpswap] added ${solAmount.toFixed(4)} SOL to LP — tx: ${sig}`);
     return sig;

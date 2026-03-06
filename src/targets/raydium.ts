@@ -1,4 +1,5 @@
 import { connection, wallet, log } from "../config";
+import { recordTx } from "../history";
 import { PublicKey, LAMPORTS_PER_SOL } from "@solana/web3.js";
 
 /**
@@ -48,6 +49,17 @@ export async function addRaydiumLiquidity(
 
     const execResult = await (result as any).execute({ sendAndConfirm: true });
     const sig = execResult?.txId ?? execResult?.txIds?.[0] ?? "unknown";
+
+    recordTx({
+      ts: new Date().toISOString(),
+      type: "lp-deposit",
+      sig,
+      sol: solAmount,
+      tokens: tokenAmount.toString(),
+      pool: poolAddress.toBase58(),
+      poolType: "raydium",
+      note: `CLMM position, ticks: ${tickCurrent - tickSpacing * 20}..${tickCurrent + tickSpacing * 20}`,
+    });
 
     log(`  ✓ [raydium] added ${solAmount.toFixed(4)} SOL — tx: ${sig}`);
     return sig;

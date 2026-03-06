@@ -1,4 +1,5 @@
 import { connection, wallet, log, WSOL_MINT, SLIPPAGE_PCT } from "../config";
+import { recordTx } from "../history";
 import { PublicKey, LAMPORTS_PER_SOL } from "@solana/web3.js";
 import BN from "bn.js";
 
@@ -68,6 +69,17 @@ export async function addOrcaLiquidity(
     const openResult = await (whirlpool as any).openPositionWithMetadata(tickLower, tickUpper, quote);
     const sig = await openResult.tx.buildAndExecute();
     const positionMint = openResult.positionMint || openResult.mint;
+
+    recordTx({
+      ts: new Date().toISOString(),
+      type: "lp-deposit",
+      sig,
+      sol: solAmount,
+      tokens: tokenAmount.toString(),
+      pool: poolAddress.toBase58(),
+      poolType: "orca",
+      note: `whirlpool position: ${positionMint?.toBase58()}, ticks: ${tickLower}..${tickUpper}`,
+    });
 
     log(`  ✓ [orca] added ${solAmount.toFixed(4)} SOL — position: ${positionMint?.toBase58()} — tx: ${sig}`);
     return sig;

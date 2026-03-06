@@ -2,6 +2,7 @@ import {
   connection, wallet, log,
   TOKEN_MINT, WSOL_MINT, JUPITER_BASE, JUPITER_API_KEY, SLIPPAGE_BPS,
 } from "./config";
+import { recordTx } from "./history";
 import { LAMPORTS_PER_SOL, VersionedTransaction } from "@solana/web3.js";
 
 const headers: Record<string, string> = {
@@ -69,6 +70,15 @@ export async function swapSolForToken(solAmount: number): Promise<{ tokensReceiv
     maxRetries: 3,
   });
   await connection.confirmTransaction(sig, "confirmed");
+  recordTx({
+    ts: new Date().toISOString(),
+    type: "swap",
+    sig,
+    sol: solAmount,
+    tokens: outAmount.toString(),
+    note: `SOL → token via Jupiter`,
+  });
+
   log(`✓ swap complete — tx: ${sig}`);
 
   return { tokensReceived: outAmount, txSig: sig };

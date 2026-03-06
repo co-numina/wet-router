@@ -1,4 +1,5 @@
 import { connection, wallet, log, TOKEN_MINT } from "./config";
+import { recordTx } from "./history";
 import { OnlinePumpAmmSdk } from "@pump-fun/pump-swap-sdk";
 import { PUMP_AMM_SDK } from "@pump-fun/pump-swap-sdk";
 import {
@@ -45,6 +46,7 @@ export async function claimCreatorFees(): Promise<string | null> {
       return null;
     }
 
+    const preBal = await connection.getBalance(wallet.publicKey);
     const instructions = await PUMP_AMM_SDK.collectCoinCreatorFee(state);
 
     if (instructions.length === 0) {
@@ -61,7 +63,19 @@ export async function claimCreatorFees(): Promise<string | null> {
     });
     await connection.confirmTransaction(sig, "confirmed");
 
-    log(`✓ claimed creator fees — tx: ${sig}`);
+    // Get post-claim balance to compute amount claimed
+    const postBal = await connection.getBalance(wallet.publicKey);
+    const claimedSol = Math.max(0, (postBal - preBal) / LAMPORTS_PER_SOL);
+    
+    recordTx({
+      ts: new Date().toISOString(),
+      type: "claim",
+      sig,
+      sol: claimedSol,
+      note: "creator vault fee claim",
+    });
+
+    log(`✓ claimed ${claimedSol.toFixed(4)} SOL creator fees — tx: ${sig}`);
     return sig;
   } catch (err) {
     log(`⚠ fee claim failed: ${err instanceof Error ? err.message : err}`);
