@@ -15,7 +15,7 @@
   <a href="#configuration">configuration</a> •
   <a href="#supported-dexes">supported DEXes</a> •
   <a href="#vs-competitors">vs competitors</a> •
-  <a href="https://wet-coin.vercel.app">website</a>
+  <a href="https://wet-router.fun">website</a>
 </p>
 
 ---
@@ -319,5 +319,5 @@ MIT. do whatever you want with it.
 ---
 
 <p align="center">
-  built by <a href="https://github.com/co-numina">co-numina</a> · <a href="https://wet-coin.vercel.app">wet-coin.vercel.app</a>
+  built by <a href="https://github.com/co-numina">co-numina</a> · <a href="https://wet-router.fun">wet-router.fun</a>
 </p>
